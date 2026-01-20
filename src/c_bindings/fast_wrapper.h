@@ -75,6 +75,35 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_with_progress(
     ChiavdfProgressCallback progress_cb,
     void* progress_user_data);
 
+// Same as `chiavdf_prove_one_weso_fast_streaming`, but with an optimized
+// implementation of the `GetBlock()` mapping (avoids per-block modular
+// exponentiation by precomputing block indices).
+ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    const uint8_t* y_ref_s,
+    size_t y_ref_s_size,
+    size_t discriminant_size_bits,
+    uint64_t num_iterations);
+
+// Same as `chiavdf_prove_one_weso_fast_streaming_getblock_opt`, but optionally
+// invokes `progress_cb` from the proving thread every `progress_interval`
+// iterations.
+ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt_with_progress(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    const uint8_t* y_ref_s,
+    size_t y_ref_s_size,
+    size_t discriminant_size_bits,
+    uint64_t num_iterations,
+    uint64_t progress_interval,
+    ChiavdfProgressCallback progress_cb,
+    void* progress_user_data);
+
 void chiavdf_free_byte_array(ChiavdfByteArray array);
 
 #ifdef __cplusplus
