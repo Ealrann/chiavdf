@@ -1,6 +1,7 @@
 #include "fast_wrapper.h"
 
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -45,6 +46,56 @@ uint64_t get_block(uint64_t i, uint64_t k, uint64_t T, integer& B) {
     res = res / B;
     auto res_vector = res.to_vector();
     return res_vector.empty() ? 0 : res_vector[0];
+}
+
+bool build_precomputed_getblocks(
+    std::vector<uint32_t>& out,
+    uint64_t wanted_iter,
+    uint32_t k,
+    uint32_t l,
+    uint64_t limit,
+    integer& B) {
+    unsigned __int128 total_p128 =
+        static_cast<unsigned __int128>(limit) * static_cast<unsigned __int128>(l);
+    if (total_p128 > static_cast<unsigned __int128>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+    size_t total_p = static_cast<size_t>(total_p128);
+    out.assign(total_p, 0);
+
+    if (k == 0 || total_p == 0) {
+        return true;
+    }
+
+    uint64_t k_u64 = static_cast<uint64_t>(k);
+    uint64_t max_p_plus1 = wanted_iter / k_u64;
+    if (max_p_plus1 == 0) {
+        return true;
+    }
+    uint64_t max_p = max_p_plus1 - 1;
+    if (max_p >= total_p) {
+        max_p = static_cast<uint64_t>(total_p) - 1;
+    }
+
+    integer two_k_mod = FastPow(2, k_u64, B);
+    integer inv;
+    if (mpz_invert(inv.impl, two_k_mod.impl, B.impl) == 0) {
+        return false;
+    }
+
+    integer r = FastPow(2, wanted_iter - k_u64, B);
+    integer tmp;
+
+    for (uint64_t p = 0; p <= max_p; p++) {
+        mpz_mul_2exp(tmp.impl, r.impl, k);
+        mpz_fdiv_q(tmp.impl, tmp.impl, B.impl);
+        out[static_cast<size_t>(p)] = static_cast<uint32_t>(mpz_get_ui(tmp.impl));
+
+        mpz_mul(r.impl, r.impl, inv.impl);
+        mpz_mod(r.impl, r.impl, B.impl);
+    }
+
+    return true;
 }
 
 class ProgressOneWesolowskiCallback final : public OneWesolowskiCallback {
@@ -96,6 +147,7 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
         uint32_t l,
         uint64_t limit,
         integer& B,
+        const std::vector<uint32_t>* precomputed_blocks,
         uint64_t progress_interval,
         ChiavdfProgressCallback progress_cb,
         void* progress_user_data)
@@ -106,6 +158,7 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
           kl(static_cast<uint64_t>(k) * static_cast<uint64_t>(l)),
           limit(limit),
           B(B),
+          precomputed_blocks(precomputed_blocks),
           progress_interval(progress_interval),
           progress_cb(progress_cb),
           progress_user_data(progress_user_data),
@@ -147,7 +200,9 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
             if (wanted_iter < needed) {
                 continue;
             }
-            uint64_t b = get_block(p, k, wanted_iter, B);
+            uint64_t b = (precomputed_blocks != nullptr)
+                ? (*precomputed_blocks)[static_cast<size_t>(p)]
+                : get_block(p, k, wanted_iter, B);
             nucomp_form(bucket(j, b), bucket(j, b), checkpoint, D, L);
         }
     }
@@ -212,6 +267,7 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     uint64_t kl;
     uint64_t limit;
     integer B;
+    const std::vector<uint32_t>* precomputed_blocks;
     uint64_t progress_interval;
     ChiavdfProgressCallback progress_cb;
     void* progress_user_data;
@@ -221,6 +277,110 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     form result;
     bool has_result = false;
 };
+
+ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    const uint8_t* y_ref_s,
+    size_t y_ref_s_size,
+    size_t discriminant_size_bits,
+    uint64_t num_iterations,
+    uint64_t progress_interval,
+    ChiavdfProgressCallback progress_cb,
+    void* progress_user_data,
+    bool use_getblock_opt) {
+    std::call_once(init_once, init_chiavdf_fast);
+
+    if (challenge_hash == nullptr || challenge_size == 0 || x_s == nullptr || x_s_size == 0 ||
+        y_ref_s == nullptr || y_ref_s_size == 0) {
+        return empty_result();
+    }
+    if (num_iterations == 0) {
+        return empty_result();
+    }
+
+    std::vector<uint8_t> challenge_hash_bytes(challenge_hash, challenge_hash + challenge_size);
+    integer D = CreateDiscriminant(challenge_hash_bytes, static_cast<int>(discriminant_size_bits));
+    integer L = root(-D, 4);
+
+    form x = DeserializeForm(D, x_s, x_s_size);
+    form y_ref = DeserializeForm(D, y_ref_s, y_ref_s_size);
+
+    uint32_t k;
+    uint32_t l;
+    if (num_iterations >= (1 << 16)) {
+        ApproximateParameters(num_iterations, l, k);
+    } else {
+        k = 10;
+        l = 1;
+    }
+    if (k == 0) {
+        k = 1;
+    }
+    if (l == 0) {
+        l = 1;
+    }
+
+    uint64_t kl = static_cast<uint64_t>(k) * static_cast<uint64_t>(l);
+    uint64_t limit = num_iterations / kl;
+    if (num_iterations % kl) {
+        limit++;
+    }
+
+    integer B = GetB(D, x, y_ref);
+
+    std::vector<uint32_t> precomputed_blocks;
+    const std::vector<uint32_t>* precomputed_blocks_ptr = nullptr;
+    if (use_getblock_opt) {
+        if (!build_precomputed_getblocks(precomputed_blocks, num_iterations, k, l, limit, B)) {
+            return empty_result();
+        }
+        precomputed_blocks_ptr = &precomputed_blocks;
+    }
+
+    std::atomic<bool> stopped(false);
+    StreamingOneWesolowskiCallback weso(
+        D,
+        num_iterations,
+        k,
+        l,
+        limit,
+        B,
+        precomputed_blocks_ptr,
+        progress_interval,
+        progress_cb,
+        progress_user_data);
+
+    weso.process_checkpoint(/*i=*/0, x);
+
+    FastStorage* fast_storage = nullptr;
+    repeated_square(num_iterations, x, D, L, &weso, fast_storage, stopped);
+
+    if (!weso.ok()) {
+        return empty_result();
+    }
+    if (!(weso.y() == y_ref)) {
+        return empty_result();
+    }
+
+    form proof_form = weso.finalize_proof();
+
+    int d_bits = D.num_bits();
+    std::vector<unsigned char> y_serialized = SerializeForm(y_ref, d_bits);
+    std::vector<unsigned char> proof_serialized = SerializeForm(proof_form, d_bits);
+
+    if (y_serialized.empty() || proof_serialized.empty()) {
+        return empty_result();
+    }
+
+    const size_t total = y_serialized.size() + proof_serialized.size();
+    uint8_t* out = new uint8_t[total];
+    std::copy(y_serialized.begin(), y_serialized.end(), out);
+    std::copy(proof_serialized.begin(), proof_serialized.end(), out + y_serialized.size());
+    return ChiavdfByteArray{out, total};
+}
 } // namespace
 
 extern "C" ChiavdfByteArray chiavdf_prove_one_weso_fast(
@@ -334,85 +494,73 @@ extern "C" ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_with_progress(
     ChiavdfProgressCallback progress_cb,
     void* progress_user_data) {
     try {
-        std::call_once(init_once, init_chiavdf_fast);
-
-        if (challenge_hash == nullptr || challenge_size == 0 || x_s == nullptr || x_s_size == 0 ||
-            y_ref_s == nullptr || y_ref_s_size == 0) {
-            return empty_result();
-        }
-        if (num_iterations == 0) {
-            return empty_result();
-        }
-
-        std::vector<uint8_t> challenge_hash_bytes(challenge_hash, challenge_hash + challenge_size);
-        integer D = CreateDiscriminant(challenge_hash_bytes, static_cast<int>(discriminant_size_bits));
-        integer L = root(-D, 4);
-
-        form x = DeserializeForm(D, x_s, x_s_size);
-        form y_ref = DeserializeForm(D, y_ref_s, y_ref_s_size);
-
-        uint32_t k;
-        uint32_t l;
-        if (num_iterations >= (1 << 16)) {
-            ApproximateParameters(num_iterations, l, k);
-        } else {
-            k = 10;
-            l = 1;
-        }
-        if (k == 0) {
-            k = 1;
-        }
-        if (l == 0) {
-            l = 1;
-        }
-
-        uint64_t kl = static_cast<uint64_t>(k) * static_cast<uint64_t>(l);
-        uint64_t limit = num_iterations / kl;
-        if (num_iterations % kl) {
-            limit++;
-        }
-
-        integer B = GetB(D, x, y_ref);
-
-        std::atomic<bool> stopped(false);
-        StreamingOneWesolowskiCallback weso(
-            D,
+        return chiavdf_prove_one_weso_fast_streaming_impl(
+            challenge_hash,
+            challenge_size,
+            x_s,
+            x_s_size,
+            y_ref_s,
+            y_ref_s_size,
+            discriminant_size_bits,
             num_iterations,
-            k,
-            l,
-            limit,
-            B,
             progress_interval,
             progress_cb,
-            progress_user_data);
+            progress_user_data,
+            /*use_getblock_opt=*/false);
+    } catch (...) {
+        return empty_result();
+    }
+}
 
-        weso.process_checkpoint(/*i=*/0, x);
+extern "C" ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    const uint8_t* y_ref_s,
+    size_t y_ref_s_size,
+    size_t discriminant_size_bits,
+    uint64_t num_iterations) {
+    return chiavdf_prove_one_weso_fast_streaming_getblock_opt_with_progress(
+        challenge_hash,
+        challenge_size,
+        x_s,
+        x_s_size,
+        y_ref_s,
+        y_ref_s_size,
+        discriminant_size_bits,
+        num_iterations,
+        /*progress_interval=*/0,
+        /*progress_cb=*/nullptr,
+        /*progress_user_data=*/nullptr);
+}
 
-        FastStorage* fast_storage = nullptr;
-        repeated_square(num_iterations, x, D, L, &weso, fast_storage, stopped);
-
-        if (!weso.ok()) {
-            return empty_result();
-        }
-        if (!(weso.y() == y_ref)) {
-            return empty_result();
-        }
-
-        form proof_form = weso.finalize_proof();
-
-        int d_bits = D.num_bits();
-        std::vector<unsigned char> y_serialized = SerializeForm(y_ref, d_bits);
-        std::vector<unsigned char> proof_serialized = SerializeForm(proof_form, d_bits);
-
-        if (y_serialized.empty() || proof_serialized.empty()) {
-            return empty_result();
-        }
-
-        const size_t total = y_serialized.size() + proof_serialized.size();
-        uint8_t* out = new uint8_t[total];
-        std::copy(y_serialized.begin(), y_serialized.end(), out);
-        std::copy(proof_serialized.begin(), proof_serialized.end(), out + y_serialized.size());
-        return ChiavdfByteArray{out, total};
+extern "C" ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt_with_progress(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    const uint8_t* y_ref_s,
+    size_t y_ref_s_size,
+    size_t discriminant_size_bits,
+    uint64_t num_iterations,
+    uint64_t progress_interval,
+    ChiavdfProgressCallback progress_cb,
+    void* progress_user_data) {
+    try {
+        return chiavdf_prove_one_weso_fast_streaming_impl(
+            challenge_hash,
+            challenge_size,
+            x_s,
+            x_s_size,
+            y_ref_s,
+            y_ref_s_size,
+            discriminant_size_bits,
+            num_iterations,
+            progress_interval,
+            progress_cb,
+            progress_user_data,
+            /*use_getblock_opt=*/true);
     } catch (...) {
         return empty_result();
     }

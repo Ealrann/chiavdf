@@ -227,7 +227,7 @@ const int checkpoint_interval=10000; //at each checkpoint, the slave thread is r
     const double random_error_injection_rate=0; //0 to 1
 
     const bool vdf_test_correctness=false;
-    const bool enable_threads=true;
+    const bool enable_threads=false;
 
     //#define ENABLE_TRACK_CYCLES
 #endif
