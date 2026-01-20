@@ -78,6 +78,7 @@ std::mutex new_event_mutex, cout_lock;
 bool debug_mode = false;
 bool fast_algorithm = false;
 bool two_weso = false;
+bool quiet_mode = false;
 
 //always works
 void repeated_square_original(vdf_original &vdfo, form& f, const integer& D, const integer& L, uint64 base, uint64 iterations, INUDUPLListener *nuduplListener) {
@@ -236,10 +237,12 @@ void repeated_square(uint64_t iterations, form f, const integer& D, const intege
             }
         #endif
     }
-    {
-        // this shouldn't be needed but avoids some false positive in TSAN
-        std::lock_guard<std::mutex> lk(cout_lock);
-        std::cout << "VDF loop finished. Total iters: " << num_iterations << "\n" << std::flush;
+    if (!quiet_mode) {
+        {
+            // this shouldn't be needed but avoids some false positive in TSAN
+            std::lock_guard<std::mutex> lk(cout_lock);
+            std::cout << "VDF loop finished. Total iters: " << num_iterations << "\n" << std::flush;
+        }
     }
 
     #ifdef VDF_TEST
@@ -275,11 +278,6 @@ Proof ProveOneWesolowski(uint64_t iters, integer& D, form f, OneWesolowskiCallba
     proof_serialized = SerializeForm(proof_form, d_bits);
     Proof proof(y_serialized, proof_serialized);
     proof.witness_type = 0;
-    {
-        // this shouldn't be needed but avoids some false positive in TSAN
-        std::lock_guard<std::mutex> lk(cout_lock);
-        std::cout << "Got simple weso proof: " << proof.hex() << "\n";
-    }
     return proof;
 }
 
