@@ -1,7 +1,6 @@
 #include "fast_wrapper.h"
 
 #include <atomic>
-#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -46,56 +45,6 @@ uint64_t get_block(uint64_t i, uint64_t k, uint64_t T, integer& B) {
     res = res / B;
     auto res_vector = res.to_vector();
     return res_vector.empty() ? 0 : res_vector[0];
-}
-
-bool build_precomputed_getblocks(
-    std::vector<uint32_t>& out,
-    uint64_t wanted_iter,
-    uint32_t k,
-    uint32_t l,
-    uint64_t limit,
-    integer& B) {
-    unsigned __int128 total_p128 =
-        static_cast<unsigned __int128>(limit) * static_cast<unsigned __int128>(l);
-    if (total_p128 > static_cast<unsigned __int128>(std::numeric_limits<size_t>::max())) {
-        return false;
-    }
-    size_t total_p = static_cast<size_t>(total_p128);
-    out.assign(total_p, 0);
-
-    if (k == 0 || total_p == 0) {
-        return true;
-    }
-
-    uint64_t k_u64 = static_cast<uint64_t>(k);
-    uint64_t max_p_plus1 = wanted_iter / k_u64;
-    if (max_p_plus1 == 0) {
-        return true;
-    }
-    uint64_t max_p = max_p_plus1 - 1;
-    if (max_p >= total_p) {
-        max_p = static_cast<uint64_t>(total_p) - 1;
-    }
-
-    integer two_k_mod = FastPow(2, k_u64, B);
-    integer inv;
-    if (mpz_invert(inv.impl, two_k_mod.impl, B.impl) == 0) {
-        return false;
-    }
-
-    integer r = FastPow(2, wanted_iter - k_u64, B);
-    integer tmp;
-
-    for (uint64_t p = 0; p <= max_p; p++) {
-        mpz_mul_2exp(tmp.impl, r.impl, k);
-        mpz_fdiv_q(tmp.impl, tmp.impl, B.impl);
-        out[static_cast<size_t>(p)] = static_cast<uint32_t>(mpz_get_ui(tmp.impl));
-
-        mpz_mul(r.impl, r.impl, inv.impl);
-        mpz_mod(r.impl, r.impl, B.impl);
-    }
-
-    return true;
 }
 
 class ProgressOneWesolowskiCallback final : public OneWesolowskiCallback {
@@ -147,7 +96,7 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
         uint32_t l,
         uint64_t limit,
         integer& B,
-        const std::vector<uint32_t>* precomputed_blocks,
+        bool use_getblock_opt,
         uint64_t progress_interval,
         ChiavdfProgressCallback progress_cb,
         void* progress_user_data)
@@ -158,13 +107,17 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
           kl(static_cast<uint64_t>(k) * static_cast<uint64_t>(l)),
           limit(limit),
           B(B),
-          precomputed_blocks(precomputed_blocks),
+          use_getblock_opt(use_getblock_opt),
           progress_interval(progress_interval),
           progress_cb(progress_cb),
           progress_user_data(progress_user_data),
           next_progress(progress_interval) {
         form id = form::identity(D);
         buckets.resize(static_cast<size_t>(l) * (1ULL << k), id);
+
+        if (use_getblock_opt) {
+            getblock_ok = init_getblock_opt_state();
+        }
     }
 
     void OnIteration(int type, void* data, uint64_t iteration) override {
@@ -198,14 +151,14 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
             uint64_t p = i * static_cast<uint64_t>(l) + static_cast<uint64_t>(j);
             uint64_t needed = static_cast<uint64_t>(k) * (p + 1);
             if (wanted_iter < needed) {
-                continue;
+                break;
             }
-            uint64_t b = (precomputed_blocks != nullptr)
-                ? (*precomputed_blocks)[static_cast<size_t>(p)]
-                : get_block(p, k, wanted_iter, B);
+            uint64_t b = use_getblock_opt ? get_block_opt(p) : get_block(p, k, wanted_iter, B);
             nucomp_form(bucket(j, b), bucket(j, b), checkpoint, D, L);
         }
     }
+
+    bool init_ok() const { return getblock_ok; }
 
     bool ok() const { return has_result; }
 
@@ -276,6 +229,59 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     std::vector<form> buckets;
     form result;
     bool has_result = false;
+
+    bool use_getblock_opt;
+    bool getblock_ok = true;
+    uint64_t getblock_next_p = 0;
+    integer getblock_inv_2k;
+    integer getblock_r;
+    integer getblock_tmp;
+
+    bool init_getblock_opt_state() {
+        if (k == 0) {
+            return false;
+        }
+        uint64_t k_u64 = static_cast<uint64_t>(k);
+        if (wanted_iter < k_u64) {
+            return true;
+        }
+
+        integer two_k_mod = FastPow(2, k_u64, B);
+        if (mpz_invert(getblock_inv_2k.impl, two_k_mod.impl, B.impl) == 0) {
+            return false;
+        }
+
+        getblock_r = FastPow(2, wanted_iter - k_u64, B);
+        getblock_next_p = 0;
+        return true;
+    }
+
+    uint64_t get_block_opt(uint64_t p) {
+        if (!getblock_ok || wanted_iter < static_cast<uint64_t>(k)) {
+            return get_block(p, k, wanted_iter, B);
+        }
+
+        // Expected call pattern is sequential `p`. If we ever get out of sync,
+        // advance state forward or fall back to the slow mapping.
+        if (p < getblock_next_p) {
+            return get_block(p, k, wanted_iter, B);
+        }
+        while (getblock_next_p < p) {
+            mpz_mul(getblock_r.impl, getblock_r.impl, getblock_inv_2k.impl);
+            mpz_mod(getblock_r.impl, getblock_r.impl, B.impl);
+            getblock_next_p++;
+        }
+
+        mpz_mul_2exp(getblock_tmp.impl, getblock_r.impl, k);
+        mpz_fdiv_q(getblock_tmp.impl, getblock_tmp.impl, B.impl);
+        uint64_t b = mpz_get_ui(getblock_tmp.impl);
+
+        mpz_mul(getblock_r.impl, getblock_r.impl, getblock_inv_2k.impl);
+        mpz_mod(getblock_r.impl, getblock_r.impl, B.impl);
+        getblock_next_p++;
+
+        return b;
+    }
 };
 
 ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
@@ -331,15 +337,6 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
 
     integer B = GetB(D, x, y_ref);
 
-    std::vector<uint32_t> precomputed_blocks;
-    const std::vector<uint32_t>* precomputed_blocks_ptr = nullptr;
-    if (use_getblock_opt) {
-        if (!build_precomputed_getblocks(precomputed_blocks, num_iterations, k, l, limit, B)) {
-            return empty_result();
-        }
-        precomputed_blocks_ptr = &precomputed_blocks;
-    }
-
     std::atomic<bool> stopped(false);
     StreamingOneWesolowskiCallback weso(
         D,
@@ -348,10 +345,14 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
         l,
         limit,
         B,
-        precomputed_blocks_ptr,
+        use_getblock_opt,
         progress_interval,
         progress_cb,
         progress_user_data);
+
+    if (!weso.init_ok()) {
+        return empty_result();
+    }
 
     weso.process_checkpoint(/*i=*/0, x);
 
