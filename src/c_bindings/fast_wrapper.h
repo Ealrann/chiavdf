@@ -49,6 +49,12 @@ bool chiavdf_get_last_streaming_stats(
     uint64_t* out_checkpoint_calls,
     uint64_t* out_bucket_updates);
 
+typedef struct {
+    const uint8_t* y_ref_s;
+    size_t y_ref_s_size;
+    uint64_t num_iterations;
+} ChiavdfBatchJob;
+
 // Computes a compact (witness_type=0) Wesolowski proof using the fast engine.
 //
 // On success, returns `y || proof` where:
@@ -137,6 +143,46 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt_with_progres
     uint64_t progress_interval,
     ChiavdfProgressCallback progress_cb,
     void* progress_user_data);
+
+// Computes multiple compact (witness_type=0) Wesolowski proofs in one shared
+// squaring run ("Trick 2"), using the streaming algorithm (Trick 1) and the
+// GetBlock precomputation optimization.
+//
+// All jobs in the batch must share the same:
+// - `challenge_hash`
+// - `x_s` (input form bytes)
+// - `discriminant_size_bits`
+//
+// Returns an array of `job_count` byte arrays, each containing `y || proof` on
+// success. The caller must free the returned array using
+// `chiavdf_free_byte_array_batch(...)`.
+//
+// On fatal error (including output mismatch), returns NULL.
+ChiavdfByteArray* chiavdf_prove_one_weso_fast_streaming_getblock_opt_batch(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    size_t discriminant_size_bits,
+    const ChiavdfBatchJob* jobs,
+    size_t job_count);
+
+// Same as `chiavdf_prove_one_weso_fast_streaming_getblock_opt_batch`, but
+// optionally invokes `progress_cb` from the proving thread every
+// `progress_interval` squaring iterations completed.
+ChiavdfByteArray* chiavdf_prove_one_weso_fast_streaming_getblock_opt_batch_with_progress(
+    const uint8_t* challenge_hash,
+    size_t challenge_size,
+    const uint8_t* x_s,
+    size_t x_s_size,
+    size_t discriminant_size_bits,
+    const ChiavdfBatchJob* jobs,
+    size_t job_count,
+    uint64_t progress_interval,
+    ChiavdfProgressCallback progress_cb,
+    void* progress_user_data);
+
+void chiavdf_free_byte_array_batch(ChiavdfByteArray* arrays, size_t count);
 
 void chiavdf_free_byte_array(ChiavdfByteArray array);
 
