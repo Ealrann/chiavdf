@@ -77,7 +77,7 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_with_progress(
 
 // Same as `chiavdf_prove_one_weso_fast_streaming`, but with an optimized
 // implementation of the `GetBlock()` mapping (avoids per-block modular
-// exponentiation by precomputing block indices).
+// exponentiation without allocating a full `GetBlock` table).
 ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt(
     const uint8_t* challenge_hash,
     size_t challenge_size,
