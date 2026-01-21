@@ -1,6 +1,8 @@
 #include "fast_wrapper.h"
 
 #include <atomic>
+#include <chrono>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -17,6 +19,28 @@ bool enable_all_instructions = false;
 
 namespace {
 std::once_flag init_once;
+std::atomic<uint64_t> bucket_memory_budget_bytes(128ULL * 1024ULL * 1024ULL);
+std::atomic<bool> streaming_stats_enabled(false);
+
+struct LastStreamingParameters {
+    uint32_t k = 0;
+    uint32_t l = 0;
+    bool tuned = false;
+    bool set = false;
+};
+
+thread_local LastStreamingParameters last_streaming_parameters;
+
+struct LastStreamingStats {
+    uint64_t checkpoint_total_ns = 0;
+    uint64_t checkpoint_event_total_ns = 0;
+    uint64_t finalize_total_ns = 0;
+    uint64_t checkpoint_calls = 0;
+    uint64_t bucket_updates = 0;
+    bool set = false;
+};
+
+thread_local LastStreamingStats last_streaming_stats;
 
 void init_chiavdf_fast() {
     init_gmp();
@@ -38,6 +62,83 @@ void init_chiavdf_fast() {
 }
 
 ChiavdfByteArray empty_result() { return ChiavdfByteArray{nullptr, 0}; }
+
+uint64_t estimate_bucket_form_bytes(size_t discriminant_size_bits) {
+    // Be conservative: class group forms contain 3 GMP-backed integers that
+    // quickly grow to the discriminant size (or beyond) during NUCOMP.
+    //
+    // This estimate is intentionally larger than the raw serialized size to
+    // avoid picking parameters that risk paging/OOM.
+    uint64_t discr_bytes = (static_cast<uint64_t>(discriminant_size_bits) + 7) / 8;
+    uint64_t estimate = discr_bytes * 16;
+    if (estimate < 2048) {
+        estimate = 2048;
+    }
+    return estimate;
+}
+
+bool tune_streaming_parameters(
+    uint64_t num_iterations,
+    size_t discriminant_size_bits,
+    uint64_t memory_budget_bytes,
+    uint32_t& out_l,
+    uint32_t& out_k) {
+    if (memory_budget_bytes == 0) {
+        return false;
+    }
+
+    // Keep headroom for GMP scratch allocations and general process overhead.
+    uint64_t budget = (memory_budget_bytes * 80) / 100;
+    uint64_t bytes_per_form = estimate_bucket_form_bytes(discriminant_size_bits);
+    if (budget < bytes_per_form) {
+        return false;
+    }
+
+    unsigned __int128 best_cost = std::numeric_limits<unsigned __int128>::max();
+    bool found = false;
+
+    // Empirical tuning notes (1024-bit discriminants, AVX2 build):
+    // - Each bucket update (NUCOMP) and each fold unit is ~5µs.
+    // - Per-checkpoint event overhead (SetForm + bookkeeping) is ~0.3µs.
+    //
+    // So checkpoint counts should be weighted much lower than updates/fold.
+    constexpr unsigned __int128 update_weight = 16;
+    constexpr unsigned __int128 fold_weight = 16;
+    constexpr unsigned __int128 checkpoint_weight = 1;
+
+    // Search a small grid of `(k,l)` values. Higher `k` reduces checkpoint work
+    // (~T/k) but increases fold work (~l·2^k) and bucket memory (~l·2^k).
+    for (uint32_t k = 4; k <= 20; k++) {
+        unsigned __int128 buckets_per_row = static_cast<unsigned __int128>(1) << k;
+
+        for (uint32_t l = 1; l <= 64; l++) {
+            unsigned __int128 form_count = buckets_per_row * static_cast<unsigned __int128>(l);
+            unsigned __int128 mem_required =
+                form_count * static_cast<unsigned __int128>(bytes_per_form);
+            if (mem_required > static_cast<unsigned __int128>(budget)) {
+                continue;
+            }
+
+            unsigned __int128 updates = static_cast<unsigned __int128>(
+                (num_iterations + static_cast<uint64_t>(k) - 1) / static_cast<uint64_t>(k));
+            uint64_t kl = static_cast<uint64_t>(k) * static_cast<uint64_t>(l);
+            unsigned __int128 checkpoints = static_cast<unsigned __int128>(
+                (num_iterations + kl - 1) / kl);
+            unsigned __int128 fold = static_cast<unsigned __int128>(l) << (k + 1);
+            unsigned __int128 cost =
+                updates * update_weight + checkpoints * checkpoint_weight + fold * fold_weight;
+
+            if (!found || cost < best_cost) {
+                found = true;
+                best_cost = cost;
+                out_k = k;
+                out_l = l;
+            }
+        }
+    }
+
+    return found;
+}
 
 uint64_t get_block(uint64_t i, uint64_t k, uint64_t T, integer& B) {
     integer res = FastPow(2, T - k * (i + 1), B);
@@ -107,11 +208,12 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
           kl(static_cast<uint64_t>(k) * static_cast<uint64_t>(l)),
           limit(limit),
           B(B),
-          use_getblock_opt(use_getblock_opt),
           progress_interval(progress_interval),
           progress_cb(progress_cb),
           progress_user_data(progress_user_data),
-          next_progress(progress_interval) {
+          next_progress(progress_interval),
+          use_getblock_opt(use_getblock_opt),
+          stats_enabled(streaming_stats_enabled.load(std::memory_order_relaxed)) {
         form id = form::identity(D);
         buckets.resize(static_cast<size_t>(l) * (1ULL << k), id);
 
@@ -135,8 +237,18 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
             uint64_t pos = iteration / kl;
             if (pos < limit) {
                 form checkpoint;
+                auto started_at = std::chrono::steady_clock::time_point{};
+                if (stats_enabled) {
+                    started_at = std::chrono::steady_clock::now();
+                }
                 SetForm(type, data, &checkpoint);
-                process_checkpoint(pos, checkpoint);
+                process_checkpoint(pos, checkpoint, /*record_stats=*/true);
+                if (stats_enabled) {
+                    checkpoint_event_total_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - started_at)
+                            .count());
+                }
             }
         }
 
@@ -146,7 +258,14 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
         }
     }
 
-    void process_checkpoint(uint64_t i, const form& checkpoint) {
+    void process_checkpoint(uint64_t i, const form& checkpoint, bool record_stats) {
+        const bool do_stats = stats_enabled && record_stats;
+        auto started_at = std::chrono::steady_clock::time_point{};
+        if (do_stats) {
+            started_at = std::chrono::steady_clock::now();
+        }
+
+        uint64_t local_updates = 0;
         for (uint32_t j = 0; j < l; j++) {
             uint64_t p = i * static_cast<uint64_t>(l) + static_cast<uint64_t>(j);
             uint64_t needed = static_cast<uint64_t>(k) * (p + 1);
@@ -154,7 +273,19 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
                 break;
             }
             uint64_t b = use_getblock_opt ? get_block_opt(p) : get_block(p, k, wanted_iter, B);
+            if (do_stats) {
+                local_updates++;
+            }
             nucomp_form(bucket(j, b), bucket(j, b), checkpoint, D, L);
+        }
+
+        if (do_stats) {
+            checkpoint_calls++;
+            bucket_updates += local_updates;
+            checkpoint_total_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started_at)
+                    .count());
         }
     }
 
@@ -165,6 +296,11 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     const form& y() const { return result; }
 
     form finalize_proof() {
+        auto started_at = std::chrono::steady_clock::time_point{};
+        if (stats_enabled) {
+            started_at = std::chrono::steady_clock::now();
+        }
+
         PulmarkReducer reducer;
         form id = form::identity(D);
 
@@ -200,7 +336,27 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
         }
 
         reducer.reduce(x);
+
+        if (stats_enabled) {
+            finalize_total_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started_at)
+                    .count());
+        }
         return x;
+    }
+
+    bool stats_ok() const { return stats_enabled; }
+
+    LastStreamingStats stats() const {
+        LastStreamingStats out;
+        out.checkpoint_total_ns = checkpoint_total_ns;
+        out.checkpoint_event_total_ns = checkpoint_event_total_ns;
+        out.finalize_total_ns = finalize_total_ns;
+        out.checkpoint_calls = checkpoint_calls;
+        out.bucket_updates = bucket_updates;
+        out.set = stats_enabled;
+        return out;
     }
 
   private:
@@ -220,7 +376,6 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     uint64_t kl;
     uint64_t limit;
     integer B;
-    const std::vector<uint32_t>* precomputed_blocks;
     uint64_t progress_interval;
     ChiavdfProgressCallback progress_cb;
     void* progress_user_data;
@@ -236,6 +391,13 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
     integer getblock_inv_2k;
     integer getblock_r;
     integer getblock_tmp;
+
+    bool stats_enabled;
+    uint64_t checkpoint_total_ns = 0;
+    uint64_t checkpoint_event_total_ns = 0;
+    uint64_t finalize_total_ns = 0;
+    uint64_t checkpoint_calls = 0;
+    uint64_t bucket_updates = 0;
 
     bool init_getblock_opt_state() {
         if (k == 0) {
@@ -299,6 +461,8 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
     bool use_getblock_opt) {
     std::call_once(init_once, init_chiavdf_fast);
 
+    last_streaming_stats = LastStreamingStats{};
+
     if (challenge_hash == nullptr || challenge_size == 0 || x_s == nullptr || x_s_size == 0 ||
         y_ref_s == nullptr || y_ref_s_size == 0) {
         return empty_result();
@@ -316,11 +480,19 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
 
     uint32_t k;
     uint32_t l;
+    bool tuned = false;
+    const uint64_t budget =
+        bucket_memory_budget_bytes.load(std::memory_order_relaxed);
     if (num_iterations >= (1 << 16)) {
-        ApproximateParameters(num_iterations, l, k);
-    } else {
-        k = 10;
-        l = 1;
+        tuned = tune_streaming_parameters(num_iterations, discriminant_size_bits, budget, l, k);
+    }
+    if (!tuned) {
+        if (num_iterations >= (1 << 16)) {
+            ApproximateParameters(num_iterations, l, k);
+        } else {
+            k = 10;
+            l = 1;
+        }
     }
     if (k == 0) {
         k = 1;
@@ -328,6 +500,11 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
     if (l == 0) {
         l = 1;
     }
+
+    last_streaming_parameters.k = k;
+    last_streaming_parameters.l = l;
+    last_streaming_parameters.tuned = tuned;
+    last_streaming_parameters.set = true;
 
     uint64_t kl = static_cast<uint64_t>(k) * static_cast<uint64_t>(l);
     uint64_t limit = num_iterations / kl;
@@ -354,7 +531,7 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
         return empty_result();
     }
 
-    weso.process_checkpoint(/*i=*/0, x);
+    weso.process_checkpoint(/*i=*/0, x, /*record_stats=*/false);
 
     FastStorage* fast_storage = nullptr;
     repeated_square(num_iterations, x, D, L, &weso, fast_storage, stopped);
@@ -367,6 +544,10 @@ ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_impl(
     }
 
     form proof_form = weso.finalize_proof();
+
+    if (weso.stats_ok()) {
+        last_streaming_stats = weso.stats();
+    }
 
     int d_bits = D.num_bits();
     std::vector<unsigned char> y_serialized = SerializeForm(y_ref, d_bits);
@@ -565,6 +746,50 @@ extern "C" ChiavdfByteArray chiavdf_prove_one_weso_fast_streaming_getblock_opt_w
     } catch (...) {
         return empty_result();
     }
+}
+
+extern "C" void chiavdf_set_bucket_memory_budget_bytes(uint64_t bytes) {
+    bucket_memory_budget_bytes.store(bytes, std::memory_order_relaxed);
+}
+
+extern "C" void chiavdf_set_enable_streaming_stats(bool enable) {
+    streaming_stats_enabled.store(enable, std::memory_order_relaxed);
+    last_streaming_stats = LastStreamingStats{};
+}
+
+extern "C" bool chiavdf_get_last_streaming_parameters(uint32_t* out_k, uint32_t* out_l, bool* out_tuned) {
+    if (out_k == nullptr || out_l == nullptr || out_tuned == nullptr) {
+        return false;
+    }
+    if (!last_streaming_parameters.set) {
+        return false;
+    }
+    *out_k = last_streaming_parameters.k;
+    *out_l = last_streaming_parameters.l;
+    *out_tuned = last_streaming_parameters.tuned;
+    return true;
+}
+
+extern "C" bool chiavdf_get_last_streaming_stats(
+    uint64_t* out_checkpoint_total_ns,
+    uint64_t* out_checkpoint_event_total_ns,
+    uint64_t* out_finalize_total_ns,
+    uint64_t* out_checkpoint_calls,
+    uint64_t* out_bucket_updates) {
+    if (out_checkpoint_total_ns == nullptr || out_checkpoint_event_total_ns == nullptr ||
+        out_finalize_total_ns == nullptr || out_checkpoint_calls == nullptr ||
+        out_bucket_updates == nullptr) {
+        return false;
+    }
+    if (!last_streaming_stats.set) {
+        return false;
+    }
+    *out_checkpoint_total_ns = last_streaming_stats.checkpoint_total_ns;
+    *out_checkpoint_event_total_ns = last_streaming_stats.checkpoint_event_total_ns;
+    *out_finalize_total_ns = last_streaming_stats.finalize_total_ns;
+    *out_checkpoint_calls = last_streaming_stats.checkpoint_calls;
+    *out_bucket_updates = last_streaming_stats.bucket_updates;
+    return true;
 }
 
 extern "C" void chiavdf_free_byte_array(ChiavdfByteArray array) { delete[] array.data; }

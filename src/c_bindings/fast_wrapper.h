@@ -15,6 +15,40 @@ typedef struct {
 
 typedef void (*ChiavdfProgressCallback)(uint64_t iters_done, void* user_data);
 
+// Configure the per-process memory budget used by the parameter tuner when
+// selecting `(k,l)` for streaming/bucket-based proving.
+//
+// The budget is per worker process (not global across multiple processes).
+//
+// If `bytes` is 0, the default chiavdf heuristic is used.
+void chiavdf_set_bucket_memory_budget_bytes(uint64_t bytes);
+
+// Debug helper: returns the `(k,l)` parameters selected for the most recent
+// streaming proof computed on the current thread.
+//
+// Returns true if parameters are available.
+bool chiavdf_get_last_streaming_parameters(uint32_t* out_k, uint32_t* out_l, bool* out_tuned);
+
+// Enable lightweight timing counters for the streaming prover.
+//
+// When enabled, the native library records basic timing counters for the most
+// recent streaming proof computed on the current thread. This is intended for
+// benchmarking and tuning; production runs should keep this disabled to avoid
+// extra overhead.
+void chiavdf_set_enable_streaming_stats(bool enable);
+
+// Debug helper: returns timing counters for the most recent streaming proof on
+// the current thread.
+//
+// Returns true if stats are available (i.e. stats enabled and a streaming proof
+// was computed successfully).
+bool chiavdf_get_last_streaming_stats(
+    uint64_t* out_checkpoint_total_ns,
+    uint64_t* out_checkpoint_event_total_ns,
+    uint64_t* out_finalize_total_ns,
+    uint64_t* out_checkpoint_calls,
+    uint64_t* out_bucket_updates);
+
 // Computes a compact (witness_type=0) Wesolowski proof using the fast engine.
 //
 // On success, returns `y || proof` where:
