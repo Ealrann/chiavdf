@@ -1,4 +1,4 @@
-# chiavdf (BlueBlock fork)
+# chiavdf (WesoForge fork)
 
 This repository is a fork of the official Chia Network `chiavdf` implementation:
 https://github.com/Chia-Network/chiavdf
@@ -7,12 +7,12 @@ https://github.com/Chia-Network/chiavdf
 
 This fork exists to support **Bluebox proof compaction** at scale by providing **lower-level Rust bindings** than the upstream `rust_bindings/` layer, with a focus on running many independent workers efficiently (multi-process / multi-core).
 
-BlueBlock (our `bbr_client` compaction client, consuming these bindings):
-https://github.com/Ealrann/blueblock
+WesoForge (our compaction client, consuming these bindings):
+https://github.com/Ealrann/WesoForge
 
 This README is intentionally high-level and assumes you already know chiavdf’s primitives and the one‑Wesolowski (“compact witness”) workflow.
 
-## Trick 1 — Streaming One‑Wesolowski (known `y_ref`) — ~3× lower memory
+## Streaming One‑Wesolowski (known `y_ref`) — ~3× lower memory
 
 For Bluebox compaction, each job already includes the expected output `y_ref` (the `VDFInfo.output` from the block). That means we can compute the Wesolowski prime `B = GetB(D, x0, y_ref)` **before** starting the squaring loop.
 
