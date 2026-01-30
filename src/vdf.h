@@ -90,6 +90,19 @@ bool fast_algorithm = false;
 bool two_weso = false;
 bool quiet_mode = false;
 
+// vdf_fast uses shared master/slave counters keyed by `square_state.pairindex`.
+// The upstream chiavdf binaries run one VDF per process and hardcode `pairindex=0`.
+// In embedded/multi-worker setups (like WesoForge), multiple VDF computations can
+// run concurrently in the same process; they must not share a pairindex.
+#if defined(ARCH_X86) || defined(ARCH_X64)
+inline int vdf_fast_pairindex() {
+    constexpr int kSlots = int(sizeof(master_counter) / sizeof(master_counter[0]));
+    static std::atomic<int> next_slot{0};
+    thread_local int slot = next_slot.fetch_add(1, std::memory_order_relaxed) % kSlots;
+    return slot;
+}
+#endif
+
 //always works
 void repeated_square_original(vdf_original &vdfo, form& f, const integer& D, const integer& L, uint64 base, uint64 iterations, INUDUPLListener *nuduplListener) {
     vdf_original::form f_in, *f_res;
@@ -197,7 +210,7 @@ void repeated_square(uint64_t iterations, form f, const integer& D, const intege
 #if defined(ARCH_X86) || defined(ARCH_X64)
         // x86/x64: use the phased pipeline.
         square_state_type square_state;
-        square_state.pairindex = 0;
+        square_state.pairindex=vdf_fast_pairindex();
         actual_iterations = repeated_square_fast(square_state, f, D, L, num_iterations, batch_size, weso);
 #else
         // Non-x86: use the C++ NUDUPL path (faster and lower maintenance than the phased pipeline).
