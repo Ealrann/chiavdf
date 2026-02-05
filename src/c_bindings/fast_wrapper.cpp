@@ -454,6 +454,9 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
           progress_interval(progress_interval),
           progress_cb(progress_cb),
           progress_user_data(progress_user_data),
+          next_checkpoint_t(
+              (limit <= 1) ? std::numeric_limits<uint64_t>::max()
+                           : (static_cast<uint64_t>(k) * static_cast<uint64_t>(l))),
           next_progress(progress_interval) {}
 
     bool init_ok() const { return buckets.init_ok(); }
@@ -469,52 +472,60 @@ class StreamingOneWesolowskiCallback final : public WesolowskiCallback {
             next_progress += progress_interval;
         }
 
-	        uint64_t stride = buckets.checkpoint_stride();
-	        if (stride != 0 && iteration % stride == 0) {
-	            uint64_t pos = iteration / stride;
-	            if (pos < buckets.checkpoint_limit()) {
-	                form checkpoint;
-	                auto started_at = std::chrono::steady_clock::time_point{};
-	                const bool do_stats = buckets.stats_ok();
-	                if (do_stats) {
-	                    started_at = std::chrono::steady_clock::now();
-	                }
-	                SetForm(type, data, &checkpoint);
-	                buckets.process_checkpoint(pos, checkpoint);
-	                if (do_stats) {
-	                    buckets.record_checkpoint_event_ns(static_cast<uint64_t>(
-	                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                            std::chrono::steady_clock::now() - started_at)
-	                            .count()));
-	                }
-	            }
-	        }
+        const uint64_t stride = buckets.checkpoint_stride();
+        if (stride != 0 && iteration == next_checkpoint_t) {
+            const uint64_t pos = iteration / stride;
+            if (pos < buckets.checkpoint_limit()) {
+                form checkpoint;
+                auto started_at = std::chrono::steady_clock::time_point{};
+                const bool do_stats = buckets.stats_ok();
+                if (do_stats) {
+                    started_at = std::chrono::steady_clock::now();
+                }
+                SetForm(type, data, &checkpoint);
+                buckets.process_checkpoint(pos, checkpoint);
+                if (do_stats) {
+                    buckets.record_checkpoint_event_ns(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - started_at)
+                            .count()));
+                }
+            }
+
+            const uint64_t next_pos = pos + 1;
+            if (next_pos < buckets.checkpoint_limit()) {
+                next_checkpoint_t = next_pos * stride;
+            } else {
+                next_checkpoint_t = std::numeric_limits<uint64_t>::max();
+            }
+        }
 
         if (iteration == buckets.wanted_iterations()) {
             SetForm(type, data, &result);
             has_result = true;
         }
-	    }
+    }
 
-	    void process_checkpoint(uint64_t i, const form& checkpoint, bool record_stats = true) {
-	        buckets.process_checkpoint(i, checkpoint, record_stats);
-	    }
+    void process_checkpoint(uint64_t i, const form& checkpoint, bool record_stats = true) {
+        buckets.process_checkpoint(i, checkpoint, record_stats);
+    }
 
     bool ok() const { return has_result; }
 
-	    const form& y() const { return result; }
+    const form& y() const { return result; }
 
-	    form finalize_proof() const { return buckets.finalize_proof(); }
+    form finalize_proof() const { return buckets.finalize_proof(); }
 
-	    bool stats_ok() const { return buckets.stats_ok(); }
+    bool stats_ok() const { return buckets.stats_ok(); }
 
-	    LastStreamingStats stats() const { return buckets.stats(); }
+    LastStreamingStats stats() const { return buckets.stats(); }
 
-	  private:
-	    StreamingWesolowskiBuckets buckets;
+  private:
+    StreamingWesolowskiBuckets buckets;
     uint64_t progress_interval;
     ChiavdfProgressCallback progress_cb;
     void* progress_user_data;
+    uint64_t next_checkpoint_t;
     uint64_t next_progress;
 
     form result;
