@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -260,12 +262,16 @@ class StreamingWesolowskiBuckets {
 	    bool init_ok() const { return getblock_ok; }
 
 	    form finalize_proof() const {
+	        PulmarkReducer reducer;
+	        return finalize_proof_with_reducer(reducer);
+	    }
+
+	    form finalize_proof_with_reducer(PulmarkReducer& reducer) const {
 	        auto started_at = std::chrono::steady_clock::time_point{};
 	        if (stats_enabled) {
 	            started_at = std::chrono::steady_clock::now();
 	        }
 
-	        PulmarkReducer reducer;
 	        form id = form::identity(D);
 
         uint64_t k1 = k / 2;
@@ -575,7 +581,9 @@ class BatchOneWesolowskiCallback final : public WesolowskiCallback {
           progress_interval(progress_interval),
           progress_cb(progress_cb),
 	          progress_user_data(progress_user_data),
-	          next_progress(progress_interval) {}
+	          next_progress(progress_interval) {
+        start_finalizer_pool();
+    }
 
 	    void initialize(const form& x0) {
 	        for (size_t job_pos = 0; job_pos < jobs.size(); job_pos++) {
@@ -645,12 +653,20 @@ class BatchOneWesolowskiCallback final : public WesolowskiCallback {
     bool ok() const { return !fatal_error; }
 
     void join_finalizers() {
+        {
+            std::lock_guard<std::mutex> lk(finalizer_mutex);
+            finalizer_shutdown = true;
+        }
+        finalizer_cv.notify_all();
         for (auto& t : finalizers) {
             if (t.joinable()) {
                 t.join();
             }
         }
         finalizers.clear();
+        while (!finalize_queue.empty()) {
+            finalize_queue.pop();
+        }
     }
 
   private:
@@ -662,6 +678,78 @@ class BatchOneWesolowskiCallback final : public WesolowskiCallback {
     struct JobEventGreater {
         bool operator()(const JobEvent& a, const JobEvent& b) const noexcept { return a.t > b.t; }
     };
+
+    struct FinalizeTask {
+        size_t idx;
+        form y_ref;
+        StreamingWesolowskiBuckets buckets;
+
+        FinalizeTask(size_t idx, form y_ref, StreamingWesolowskiBuckets buckets)
+            : idx(idx), y_ref(std::move(y_ref)), buckets(std::move(buckets)) {}
+    };
+
+    void start_finalizer_pool() {
+        size_t workers = std::thread::hardware_concurrency();
+        if (workers > 1) {
+            workers--;
+        }
+        if (workers == 0) {
+            workers = 1;
+        }
+        workers = std::min(workers, job_count);
+        finalizers.reserve(workers);
+        for (size_t i = 0; i < workers; i++) {
+            finalizers.emplace_back([this]() { finalizer_worker_loop(); });
+        }
+    }
+
+    void enqueue_finalize_task(FinalizeTask task) {
+        {
+            std::lock_guard<std::mutex> lk(finalizer_mutex);
+            finalize_queue.push(std::move(task));
+        }
+        finalizer_cv.notify_one();
+    }
+
+    void finalizer_worker_loop() {
+        PulmarkReducer reducer;
+        while (true) {
+            auto task_opt = take_finalize_task();
+            if (!task_opt.has_value()) {
+                return;
+            }
+            FinalizeTask task = std::move(*task_opt);
+
+            try {
+                form proof_form = task.buckets.finalize_proof_with_reducer(reducer);
+                std::vector<unsigned char> y_serialized = SerializeForm(task.y_ref, d_bits);
+                std::vector<unsigned char> proof_serialized = SerializeForm(proof_form, d_bits);
+                if (y_serialized.empty() || proof_serialized.empty()) {
+                    out_arrays[task.idx] = empty_result();
+                    continue;
+                }
+
+                const size_t total = y_serialized.size() + proof_serialized.size();
+                uint8_t* out = new uint8_t[total];
+                std::copy(y_serialized.begin(), y_serialized.end(), out);
+                std::copy(proof_serialized.begin(), proof_serialized.end(), out + y_serialized.size());
+                out_arrays[task.idx] = ChiavdfByteArray{out, total};
+            } catch (...) {
+                out_arrays[task.idx] = empty_result();
+            }
+        }
+    }
+
+    std::optional<FinalizeTask> take_finalize_task() {
+        std::unique_lock<std::mutex> lk(finalizer_mutex);
+        finalizer_cv.wait(lk, [this]() { return finalizer_shutdown || !finalize_queue.empty(); });
+        if (finalize_queue.empty()) {
+            return std::nullopt;
+        }
+        FinalizeTask task = std::move(finalize_queue.front());
+        finalize_queue.pop();
+        return std::make_optional<FinalizeTask>(std::move(task));
+    }
 
     void schedule_job(size_t job_pos) {
         BatchJobState& job = jobs[job_pos];
@@ -693,29 +781,10 @@ class BatchOneWesolowskiCallback final : public WesolowskiCallback {
         job.next_checkpoint_t = std::numeric_limits<uint64_t>::max();
         job.next_event_t = std::numeric_limits<uint64_t>::max();
 
-        size_t idx = job.index;
-        form y_ref = std::move(job.y_ref);
-        StreamingWesolowskiBuckets buckets = std::move(job.buckets);
-
-        finalizers.emplace_back([this, idx, y_ref = std::move(y_ref), buckets = std::move(buckets)]() mutable {
-            try {
-                form proof_form = buckets.finalize_proof();
-                std::vector<unsigned char> y_serialized = SerializeForm(y_ref, d_bits);
-                std::vector<unsigned char> proof_serialized = SerializeForm(proof_form, d_bits);
-                if (y_serialized.empty() || proof_serialized.empty()) {
-                    out_arrays[idx] = empty_result();
-                    return;
-                }
-
-                const size_t total = y_serialized.size() + proof_serialized.size();
-                uint8_t* out = new uint8_t[total];
-                std::copy(y_serialized.begin(), y_serialized.end(), out);
-                std::copy(proof_serialized.begin(), proof_serialized.end(), out + y_serialized.size());
-                out_arrays[idx] = ChiavdfByteArray{out, total};
-            } catch (...) {
-                out_arrays[idx] = empty_result();
-            }
-        });
+        enqueue_finalize_task(FinalizeTask(
+            job.index,
+            std::move(job.y_ref),
+            std::move(job.buckets)));
     }
 
     const integer& shared_D;
@@ -726,6 +795,10 @@ class BatchOneWesolowskiCallback final : public WesolowskiCallback {
     std::atomic<bool>& stopped;
     std::vector<BatchJobState> jobs;
     std::vector<std::thread> finalizers;
+    std::mutex finalizer_mutex;
+    std::condition_variable finalizer_cv;
+    std::queue<FinalizeTask> finalize_queue;
+    bool finalizer_shutdown = false;
     std::priority_queue<JobEvent, std::vector<JobEvent>, JobEventGreater> event_queue;
     uint64_t next_event = std::numeric_limits<uint64_t>::max();
     uint64_t progress_interval;
