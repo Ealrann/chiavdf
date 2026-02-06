@@ -237,7 +237,9 @@ const int checkpoint_interval=10000; //at each checkpoint, the slave thread is r
 
 //this doesn't do anything outside of test code
 //this doesn't work with the divide table currently
-#define TEST_ASM
+#ifndef CHIAVDF_DISABLE_TEST_ASM
+    #define TEST_ASM
+#endif
 
 const int gcd_size=20; //multiple of 4. must be at least half the discriminant size in bits divided by 64
 

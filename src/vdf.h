@@ -50,14 +50,18 @@
 #include "util.h"
 #include "callback.h"
 #include "fast_storage.h"
+#ifndef CHIAVDF_SKIP_BOOST_ASIO
 #include <boost/asio.hpp>
+#endif
 
 #include <atomic>
 #include <optional>
 
 bool warn_on_corruption_in_production=false;
 
+#ifndef CHIAVDF_SKIP_BOOST_ASIO
 using boost::asio::ip::tcp;
+#endif
 
 struct akashnil_form {
     // y = ax^2 + bxy + y^2
@@ -84,12 +88,14 @@ bool quiet_mode = false;
 // The upstream chiavdf binaries run one VDF per process and hardcode `pairindex=0`.
 // In embedded/multi-worker setups (like WesoForge), multiple VDF computations can
 // run concurrently in the same process; they must not share a pairindex.
+#ifndef CHIAVDF_WINDOWS_FORCE_SLOW_SQUARE
 inline int vdf_fast_pairindex() {
     constexpr int kSlots = int(sizeof(master_counter) / sizeof(master_counter[0]));
     static std::atomic<int> next_slot{0};
     thread_local int slot = next_slot.fetch_add(1, std::memory_order_relaxed) % kSlots;
     return slot;
 }
+#endif
 
 //always works
 void repeated_square_original(vdf_original &vdfo, form& f, const integer& D, const integer& L, uint64 base, uint64 iterations, INUDUPLListener *nuduplListener) {
@@ -147,15 +153,27 @@ void repeated_square(uint64_t iterations, form f, const integer& D, const intege
             repeated_square_original(*weso->vdfo, f, D, L, 100); //randomize the a and b values
         #endif
 
-        // This works single threaded
-        square_state_type square_state;
-        square_state.pairindex=vdf_fast_pairindex();
+        uint64 actual_iterations = 0;
 
-        uint64 actual_iterations=repeated_square_fast(square_state, f, D, L, num_iterations, batch_size, weso);
+        #ifdef CHIAVDF_WINDOWS_FORCE_SLOW_SQUARE
+            repeated_square_original(*weso->vdfo, f, D, L, num_iterations, batch_size, weso);
+            actual_iterations = batch_size;
 
-        #ifdef VDF_TEST
-            ++num_calls_fast;
-            if (actual_iterations!=~uint64(0)) num_iterations_fast+=actual_iterations;
+            #ifdef VDF_TEST
+                ++num_calls_fast;
+                num_iterations_slow += batch_size;
+            #endif
+        #else
+            // This works single threaded
+            square_state_type square_state;
+            square_state.pairindex=vdf_fast_pairindex();
+
+            actual_iterations=repeated_square_fast(square_state, f, D, L, num_iterations, batch_size, weso);
+
+            #ifdef VDF_TEST
+                ++num_calls_fast;
+                if (actual_iterations!=~uint64(0)) num_iterations_fast+=actual_iterations;
+            #endif
         #endif
 
         #ifdef ENABLE_TRACK_CYCLES

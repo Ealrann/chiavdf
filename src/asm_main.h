@@ -13,12 +13,17 @@
 
 namespace asm_code {
 
+#if defined(_WIN32) && defined(__clang__)
+    #define CHIAVDF_ASM_ABI __attribute__((sysv_abi))
+#else
+    #define CHIAVDF_ASM_ABI
+#endif
 
 //all doubles are arrays with 2 entries. the high entry is first followed by the low entry
 //so: b, a; u1, u0; v1, v0
 //is_lehmer is all 1s or all 0s. ab_threshold is duplicated twice
-extern "C" int asm_avx2_func_gcd_base(double* ab, double* u, double* v, uint64* is_lehmer, double* ab_threshold, uint64* no_progress);
-extern "C" int asm_cel_func_gcd_base(double* ab, double* u, double* v, uint64* is_lehmer, double* ab_threshold, uint64* no_progress);
+extern "C" CHIAVDF_ASM_ABI int asm_avx2_func_gcd_base(double* ab, double* u, double* v, uint64* is_lehmer, double* ab_threshold, uint64* no_progress);
+extern "C" CHIAVDF_ASM_ABI int asm_cel_func_gcd_base(double* ab, double* u, double* v, uint64* is_lehmer, double* ab_threshold, uint64* no_progress);
 #ifdef COMPILE_ASM
 void compile_asm_gcd_base() {
     EXPAND_MACROS_SCOPE;
@@ -92,8 +97,8 @@ struct asm_func_gcd_128_data {
     uint64 no_progress;
 };
 
-extern "C" int asm_avx2_func_gcd_128(asm_func_gcd_128_data* data);
-extern "C" int asm_cel_func_gcd_128(asm_func_gcd_128_data* data);
+extern "C" CHIAVDF_ASM_ABI int asm_avx2_func_gcd_128(asm_func_gcd_128_data* data);
+extern "C" CHIAVDF_ASM_ABI int asm_cel_func_gcd_128(asm_func_gcd_128_data* data);
 #ifdef COMPILE_ASM
 void compile_asm_gcd_128() {
     EXPAND_MACROS_SCOPE_PUBLIC;
@@ -180,8 +185,8 @@ struct asm_func_gcd_unsigned_data {
     uint64 a_end_index;
 };
 
-extern "C" int asm_avx2_func_gcd_unsigned(asm_func_gcd_unsigned_data* data);
-extern "C" int asm_cel_func_gcd_unsigned(asm_func_gcd_unsigned_data* data);
+extern "C" CHIAVDF_ASM_ABI int asm_avx2_func_gcd_unsigned(asm_func_gcd_unsigned_data* data);
+extern "C" CHIAVDF_ASM_ABI int asm_cel_func_gcd_unsigned(asm_func_gcd_unsigned_data* data);
 #ifdef COMPILE_ASM
 void compile_asm_gcd_unsigned() {
     EXPAND_MACROS_SCOPE_PUBLIC;
@@ -249,7 +254,7 @@ template<int in_max_num_limbs, int out_num_limbs> uint64 asm_avx512_func_to_avx5
 );
 
 #define declare_asm_avx512_func_to_avx512_integer(in_max_num_limbs, out_num_limbs)\
-extern "C" uint64 asm_avx512_func_to_avx512_integer_ ## in_max_num_limbs ## _ ## out_num_limbs(\
+extern "C" CHIAVDF_ASM_ABI uint64 asm_avx512_func_to_avx512_integer_ ## in_max_num_limbs ## _ ## out_num_limbs(\
     uint64 in_num_limbs, const uint64* in_data, uint64* out_data\
 );\
 template<> uint64 asm_avx512_func_to_avx512_integer<in_max_num_limbs, out_num_limbs>(\
@@ -297,7 +302,7 @@ template<int in_num_limbs, int out_max_num_limbs> uint64 asm_avx512_func_to_gmp_
 );
 
 #define declare_asm_avx512_func_to_gmp_integer(in_num_limbs, out_max_num_limbs)\
-extern "C" uint64 asm_avx512_func_to_gmp_integer_ ## in_num_limbs ## _ ## out_max_num_limbs(\
+extern "C" CHIAVDF_ASM_ABI uint64 asm_avx512_func_to_gmp_integer_ ## in_num_limbs ## _ ## out_max_num_limbs(\
     uint64 in_sign, const uint64* in_data, uint64* out_data\
 );\
 template<> uint64 asm_avx512_func_to_gmp_integer<in_num_limbs, out_max_num_limbs>(\
@@ -348,7 +353,7 @@ template<int in_a_num_limbs, int in_b_num_limbs, int out_num_limbs> uint64 asm_a
 );
 
 #define declare_asm_avx512_func_add(in_a_num_limbs, in_b_num_limbs, out_num_limbs)\
-extern "C" uint64 asm_avx512_func_add_ ## in_a_num_limbs ## _ ## in_b_num_limbs ## _ ## out_num_limbs(\
+extern "C" CHIAVDF_ASM_ABI uint64 asm_avx512_func_add_ ## in_a_num_limbs ## _ ## in_b_num_limbs ## _ ## out_num_limbs(\
     uint64 in_a_sign, const uint64* in_a_data, uint64 in_b_sign, const uint64* in_b_data, uint64* out_data\
 );\
 template<> uint64 asm_avx512_func_add<in_a_num_limbs, in_b_num_limbs, out_num_limbs>(\
@@ -410,7 +415,7 @@ template<int in_a_num_limbs, int in_b_num_limbs, int out_num_limbs> uint64 asm_a
 );
 
 #define declare_asm_avx512_func_multiply(in_a_num_limbs, in_b_num_limbs, out_num_limbs)\
-extern "C" uint64 asm_avx512_func_multiply_ ## in_a_num_limbs ## _ ## in_b_num_limbs ## _ ## out_num_limbs(\
+extern "C" CHIAVDF_ASM_ABI uint64 asm_avx512_func_multiply_ ## in_a_num_limbs ## _ ## in_b_num_limbs ## _ ## out_num_limbs(\
     uint64 in_a_sign, const uint64* in_a_data, uint64 in_b_sign, const uint64* in_b_data, uint64* out_data\
 );\
 template<> uint64 asm_avx512_func_multiply<in_a_num_limbs, in_b_num_limbs, out_num_limbs>(\
