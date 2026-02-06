@@ -60,14 +60,18 @@
 #include "util.h"
 #include "callback.h"
 #include "fast_storage.h"
+#ifndef CHIAVDF_SKIP_BOOST_ASIO
 #include <boost/asio.hpp>
+#endif
 
 #include <atomic>
 #include <optional>
 
 bool warn_on_corruption_in_production=false;
 
+#ifndef CHIAVDF_SKIP_BOOST_ASIO
 using boost::asio::ip::tcp;
+#endif
 
 struct akashnil_form {
     // y = ax^2 + bxy + y^2
@@ -95,12 +99,14 @@ bool quiet_mode = false;
 // In embedded/multi-worker setups (like WesoForge), multiple VDF computations can
 // run concurrently in the same process; they must not share a pairindex.
 #if defined(ARCH_X86) || defined(ARCH_X64)
+#ifndef CHIAVDF_WINDOWS_FORCE_SLOW_SQUARE
 inline int vdf_fast_pairindex() {
     constexpr int kSlots = int(sizeof(master_counter) / sizeof(master_counter[0]));
     static std::atomic<int> next_slot{0};
     thread_local int slot = next_slot.fetch_add(1, std::memory_order_relaxed) % kSlots;
     return slot;
 }
+#endif
 #endif
 
 //always works
@@ -208,22 +214,37 @@ void repeated_square(uint64_t iterations, form f, const integer& D, const intege
 
         uint64 actual_iterations = 0;
 #if defined(ARCH_X86) || defined(ARCH_X64)
-        // x86/x64: use the phased pipeline.
-        square_state_type square_state;
-        square_state.pairindex=vdf_fast_pairindex();
-        actual_iterations = repeated_square_fast(square_state, f, D, L, num_iterations, batch_size, weso);
+        #ifdef CHIAVDF_WINDOWS_FORCE_SLOW_SQUARE
+            repeated_square_original(*weso->vdfo, f, D, L, num_iterations, batch_size, weso);
+            actual_iterations = batch_size;
+
+            #ifdef VDF_TEST
+                ++num_calls_fast;
+                num_iterations_slow += batch_size;
+            #endif
+        #else
+            // x86/x64: use the phased pipeline.
+            square_state_type square_state;
+            square_state.pairindex=vdf_fast_pairindex();
+            actual_iterations = repeated_square_fast(square_state, f, D, L, num_iterations, batch_size, weso);
+
+            #ifdef VDF_TEST
+                ++num_calls_fast;
+                if (actual_iterations!=~uint64(0)) num_iterations_fast+=actual_iterations;
+            #endif
+        #endif
 #else
         // Non-x86: use the C++ NUDUPL path (faster and lower maintenance than the phased pipeline).
         integer& D_nc = const_cast<integer&>(D);
         integer& L_nc = const_cast<integer&>(L);
         repeated_square_nudupl(f, D_nc, L_nc, num_iterations, batch_size, weso, weso);
         actual_iterations = batch_size;
-#endif
 
         #ifdef VDF_TEST
             ++num_calls_fast;
             if (actual_iterations!=~uint64(0)) num_iterations_fast+=actual_iterations;
         #endif
+#endif
 
         #ifdef ENABLE_TRACK_CYCLES
             print( "track cycles actual iterations", actual_iterations );

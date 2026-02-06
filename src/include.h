@@ -26,7 +26,12 @@ typedef unsigned __int128 uint128;
 typedef __int128 int128;
 #define USED __attribute__((used))
 #else
-#include "uint128_t/uint128_t.h"
+#if defined(__SIZEOF_INT128__)
+typedef unsigned __int128 uint128;
+typedef __int128 int128;
+#else
+#error "Windows builds require compiler support for __int128."
+#endif
 #define USED
 #endif
 #include <cassert>
