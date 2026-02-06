@@ -99,7 +99,7 @@ compile_asm: compile_asm.o
 # ---------------------------------------------------------------------------
 
 FASTLIB = libchiavdf_fastc.a
-FASTLIB_OBJS = c_bindings/fast_wrapper.o lzcnt.o asm_compiled.o avx2_asm_compiled.o avx512_asm_compiled.o
+FASTLIB_OBJS = c_bindings/fast_wrapper.o lzcnt.o $(ASM_OBJS)
 
 .PHONY: fastlib
 
