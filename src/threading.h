@@ -564,8 +564,8 @@ struct alignas(64) thread_counter {
     }
 };
 
-thread_counter master_counter[100];
-thread_counter slave_counter[100];
+thread_counter master_counter[512];
+thread_counter slave_counter[512];
 
 struct thread_state {
     int pairindex;
